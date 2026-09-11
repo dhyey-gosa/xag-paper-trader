@@ -294,29 +294,8 @@ def generate_combined_signals(df: pd.DataFrame) -> np.ndarray:
 # ============================================================
 class PaperTradingEngine:
     def __init__(self):
-        self.exchange = None
-        self.exchange_name = None
-        # Try exchanges in order: Bybit, Gate.io, Bitget, OKX, Binance
-        exchanges_to_try = [
-            ('bybit', ccxt.bybit, {'enableRateLimit': True, 'options': {'defaultType': 'linear'}}),
-            ('gateio', ccxt.gateio, {'enableRateLimit': True}),
-            ('bitget', ccxt.bitget, {'enableRateLimit': True, 'options': {'defaultType': 'swap'}}),
-            ('okx', ccxt.okx, {'enableRateLimit': True, 'options': {'defaultType': 'swap'}}),
-            ('binance', ccxt.binance, {'enableRateLimit': True, 'options': {'defaultType': 'future'}}),
-        ]
-        for name, cls, opts in exchanges_to_try:
-            try:
-                ex = cls(opts)
-                ex.fetch_ohlcv('XAG/USDT:USDT', '1m', limit=2)
-                self.exchange = ex
-                self.exchange_name = name
-                print(f"Using exchange: {name}")
-                break
-            except Exception as e:
-                print(f"{name} failed: {e}")
-                continue
-        if self.exchange is None:
-            raise RuntimeError("No exchange available")
+        self.exchange_name = 'cryptocompare'
+        self._warm = False
         self.candles = deque(maxlen=CANDLE_BUFFER)
         self.trades = []
         self.trade_id = 0
@@ -355,20 +334,43 @@ class PaperTradingEngine:
             json.dump(state, f, indent=2, default=str)
 
     def fetch_candles(self):
-        """Fetch latest candles from exchange."""
+        """Fetch latest candles from CryptoCompare (free, no geo-block)."""
         try:
-            # Bybit uses XAG/USDT:USDT for linear perpetual swaps
-            symbol = 'XAG/USDT:USDT'
-            ohlcv = self.exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=CANDLE_BUFFER)
+            import requests
+            # CryptoCompare: XAG spot, 1-minute OHLCV
+            # Historical minute data: https://min-api.cryptocompare.com/data/v2/histominute
+            url = "https://min-api.cryptocompare.com/data/v2/histominute"
+            params = {
+                'fsym': 'XAG',
+                'tsym': 'USDT',
+                'limit': CANDLE_BUFFER,
+            }
+            resp = requests.get(url, params=params, timeout=15)
+            data = resp.json()
+            
+            if data.get('Response') == 'Error':
+                # Fallback: use PAXG (gold proxy, much more data)
+                params['fsym'] = 'PAXG'
+                resp = requests.get(url, params=params, timeout=15)
+                data = resp.json()
+                if data.get('Response') == 'Error':
+                    self.error = f"CryptoCompare: {data.get('Message', 'unknown')}"
+                    return False
+            
+            candles = data.get('Data', {}).get('Data', [])
+            if not candles:
+                self.error = "No candle data from CryptoCompare"
+                return False
+            
             self.candles.clear()
-            for c in ohlcv:
+            for c in candles:
                 self.candles.append({
-                    'timestamp': pd.Timestamp(c[0], unit='ms'),
-                    'open': c[1],
-                    'high': c[2],
-                    'low': c[3],
-                    'close': c[4],
-                    'volume': c[5],
+                    'timestamp': pd.Timestamp(c['time'], unit='s'),
+                    'open': c['open'],
+                    'high': c['high'],
+                    'low': c['low'],
+                    'close': c['close'],
+                    'volume': c['volumefrom'],
                 })
             self.last_fetch = datetime.now(timezone.utc).isoformat()
             self.error = None

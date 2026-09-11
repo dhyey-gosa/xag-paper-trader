@@ -294,18 +294,11 @@ def generate_combined_signals(df: pd.DataFrame) -> np.ndarray:
 # ============================================================
 class PaperTradingEngine:
     def __init__(self):
-        # Try Binance first, fallback to OKX (Binance blocks some regions)
-        try:
-            test_exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
-            test_exchange.fetch_ohlcv('XAG/USDT', '1m', limit=2)
-            self.exchange = test_exchange
-            self.exchange_name = 'binance'
-        except Exception:
-            self.exchange = ccxt.okx({
-                'enableRateLimit': True,
-                'options': {'defaultType': 'swap'},
-            })
-            self.exchange_name = 'okx'
+        self.exchange = ccxt.bybit({
+            'enableRateLimit': True,
+            'options': {'defaultType': 'linear'},
+        })
+        self.exchange_name = 'bybit'
         self.candles = deque(maxlen=CANDLE_BUFFER)
         self.trades = []
         self.trade_id = 0
@@ -346,8 +339,8 @@ class PaperTradingEngine:
     def fetch_candles(self):
         """Fetch latest candles from exchange."""
         try:
-            # OKX uses XAG/USDT:USDT for perpetual swaps
-            symbol = 'XAG/USDT:USDT' if self.exchange_name == 'okx' else SYMBOL
+            # Bybit uses XAG/USDT:USDT for linear perpetual swaps
+            symbol = 'XAG/USDT:USDT'
             ohlcv = self.exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=CANDLE_BUFFER)
             self.candles.clear()
             for c in ohlcv:

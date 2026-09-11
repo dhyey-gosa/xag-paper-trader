@@ -612,16 +612,16 @@ def api_reset():
 
 
 # ============================================================
-# STARTUP
+# STARTUP (runs when gunicorn loads the module)
 # ============================================================
-if __name__ == '__main__':
-    # Start background thread
+def _start_background():
     t = threading.Thread(target=background_loop, daemon=True)
     t.start()
-
-    # Fetch initial data
     engine.fetch_candles()
     engine.running = True
 
+_start_background()
+
+if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)

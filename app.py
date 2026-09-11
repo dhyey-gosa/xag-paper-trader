@@ -21,7 +21,8 @@ from flask import Flask, render_template, jsonify
 # ============================================================
 # CONFIG
 # ============================================================
-SYMBOL = "XAG/USDT"
+SYMBOL = "PAXG/USDT:USDT"  # Gold perpetual swap (XAG unavailable on most exchanges)
+SYMBOL_DISPLAY = "PAXG (Gold Perp)"
 TIMEFRAME = "1m"
 CAPITAL = 100.0        # INR
 LEVERAGE = 50
@@ -294,7 +295,27 @@ def generate_combined_signals(df: pd.DataFrame) -> np.ndarray:
 # ============================================================
 class PaperTradingEngine:
     def __init__(self):
-        self.exchange_name = 'cryptocompare'
+        self.exchange = None
+        self.exchange_name = None
+        # Try exchanges in order: MEXC, KuCoin, Poloniex (all work from US)
+        exchanges_to_try = [
+            ('mexc', ccxt.mexc, {'enableRateLimit': True, 'options': {'defaultType': 'swap'}}),
+            ('kucoin', ccxt.kucoin, {'enableRateLimit': True}),
+            ('poloniex', ccxt.poloniex, {'enableRateLimit': True}),
+        ]
+        for name, cls, opts in exchanges_to_try:
+            try:
+                ex = cls(opts)
+                ex.fetch_ohlcv(SYMBOL, '1m', limit=2)
+                self.exchange = ex
+                self.exchange_name = name
+                print(f"Using exchange: {name}")
+                break
+            except Exception as e:
+                print(f"{name} failed: {e}")
+                continue
+        if self.exchange is None:
+            raise RuntimeError("No exchange available")
         self._warm = False
         self.candles = deque(maxlen=CANDLE_BUFFER)
         self.trades = []
@@ -334,43 +355,18 @@ class PaperTradingEngine:
             json.dump(state, f, indent=2, default=str)
 
     def fetch_candles(self):
-        """Fetch latest candles from CryptoCompare (free, no geo-block)."""
+        """Fetch latest candles from exchange."""
         try:
-            import requests
-            # CryptoCompare: XAG spot, 1-minute OHLCV
-            # Historical minute data: https://min-api.cryptocompare.com/data/v2/histominute
-            url = "https://min-api.cryptocompare.com/data/v2/histominute"
-            params = {
-                'fsym': 'XAG',
-                'tsym': 'USDT',
-                'limit': CANDLE_BUFFER,
-            }
-            resp = requests.get(url, params=params, timeout=15)
-            data = resp.json()
-            
-            if data.get('Response') == 'Error':
-                # Fallback: use PAXG (gold proxy, much more data)
-                params['fsym'] = 'PAXG'
-                resp = requests.get(url, params=params, timeout=15)
-                data = resp.json()
-                if data.get('Response') == 'Error':
-                    self.error = f"CryptoCompare: {data.get('Message', 'unknown')}"
-                    return False
-            
-            candles = data.get('Data', {}).get('Data', [])
-            if not candles:
-                self.error = "No candle data from CryptoCompare"
-                return False
-            
+            ohlcv = self.exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=CANDLE_BUFFER)
             self.candles.clear()
-            for c in candles:
+            for c in ohlcv:
                 self.candles.append({
-                    'timestamp': pd.Timestamp(c['time'], unit='s'),
-                    'open': c['open'],
-                    'high': c['high'],
-                    'low': c['low'],
-                    'close': c['close'],
-                    'volume': c['volumefrom'],
+                    'timestamp': pd.Timestamp(c[0], unit='ms'),
+                    'open': c[1],
+                    'high': c[2],
+                    'low': c[3],
+                    'close': c[4],
+                    'volume': c[5],
                 })
             self.last_fetch = datetime.now(timezone.utc).isoformat()
             self.error = None
@@ -538,7 +534,7 @@ class PaperTradingEngine:
         total_pnl = sum(t.pnl for t in self.trades if t.pnl is not None)
 
         return {
-            'symbol': SYMBOL,
+            'symbol': SYMBOL_DISPLAY,
             'exchange': getattr(self, 'exchange_name', 'unknown'),
             'capital': round(self.capital, 2),
             'starting_capital': CAPITAL,

@@ -294,11 +294,29 @@ def generate_combined_signals(df: pd.DataFrame) -> np.ndarray:
 # ============================================================
 class PaperTradingEngine:
     def __init__(self):
-        self.exchange = ccxt.bybit({
-            'enableRateLimit': True,
-            'options': {'defaultType': 'linear'},
-        })
-        self.exchange_name = 'bybit'
+        self.exchange = None
+        self.exchange_name = None
+        # Try exchanges in order: Bybit, Gate.io, Bitget, OKX, Binance
+        exchanges_to_try = [
+            ('bybit', ccxt.bybit, {'enableRateLimit': True, 'options': {'defaultType': 'linear'}}),
+            ('gateio', ccxt.gateio, {'enableRateLimit': True}),
+            ('bitget', ccxt.bitget, {'enableRateLimit': True, 'options': {'defaultType': 'swap'}}),
+            ('okx', ccxt.okx, {'enableRateLimit': True, 'options': {'defaultType': 'swap'}}),
+            ('binance', ccxt.binance, {'enableRateLimit': True, 'options': {'defaultType': 'future'}}),
+        ]
+        for name, cls, opts in exchanges_to_try:
+            try:
+                ex = cls(opts)
+                ex.fetch_ohlcv('XAG/USDT:USDT', '1m', limit=2)
+                self.exchange = ex
+                self.exchange_name = name
+                print(f"Using exchange: {name}")
+                break
+            except Exception as e:
+                print(f"{name} failed: {e}")
+                continue
+        if self.exchange is None:
+            raise RuntimeError("No exchange available")
         self.candles = deque(maxlen=CANDLE_BUFFER)
         self.trades = []
         self.trade_id = 0

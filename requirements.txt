@@ -3,3 +3,4 @@ ccxt>=4.0
 pandas>=2.0
 numpy>=1.24
 gunicorn>=21.0
+websocket-client>=1.6

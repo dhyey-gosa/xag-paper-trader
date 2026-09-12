@@ -8,6 +8,7 @@ import json
 import time
 import threading
 import traceback
+import websocket
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
@@ -21,8 +22,9 @@ from flask import Flask, render_template, jsonify
 # ============================================================
 # CONFIG
 # ============================================================
-SYMBOL = "PAXG/USDT:USDT"  # Gold perpetual swap (XAG unavailable on most exchanges)
-SYMBOL_DISPLAY = "PAXG (Gold Perp)"
+SYMBOL_MEXC = "SILVER/USDT:USDT"  # Silver perp on MEXC (works from Render US)
+SYMBOL_BINANCE = "XAG/USDT"       # Silver on Binance (works from India)
+SYMBOL_DISPLAY = "SILVER/USDT (Silver)"
 TIMEFRAME = "1m"
 CAPITAL = 100.0        # INR
 LEVERAGE = 50
@@ -30,7 +32,8 @@ RISK_PCT = 0.50        # 50% risk per trade
 TP_ATR = 1.8
 SL_ATR = 0.6
 CANDLE_BUFFER = 200    # Keep last 200 candles for indicators
-FETCH_INTERVAL = 60    # Fetch every 60 seconds (1 candle)
+FETCH_INTERVAL = 10    # Fetch candles every 10 seconds
+WS_TICK_INTERVAL = 1   # WebSocket price tick every 1 second
 MAKER_FEE = 0.0002
 TAKER_FEE = 0.0005
 
@@ -297,19 +300,21 @@ class PaperTradingEngine:
     def __init__(self):
         self.exchange = None
         self.exchange_name = None
-        # Try exchanges in order: MEXC, KuCoin, Poloniex (all work from US)
+        # Try exchanges in order: MEXC works everywhere (incl Render US)
+        # Binance/Bybit only work from India
         exchanges_to_try = [
             ('mexc', ccxt.mexc, {'enableRateLimit': True, 'options': {'defaultType': 'swap'}}),
-            ('kucoin', ccxt.kucoin, {'enableRateLimit': True}),
-            ('poloniex', ccxt.poloniex, {'enableRateLimit': True}),
+            ('binance', ccxt.binance, {'enableRateLimit': True, 'options': {'defaultType': 'future'}}),
+            ('bybit', ccxt.bybit, {'enableRateLimit': True, 'options': {'defaultType': 'linear'}}),
         ]
         for name, cls, opts in exchanges_to_try:
             try:
                 ex = cls(opts)
-                ex.fetch_ohlcv(SYMBOL, '1m', limit=2)
+                sym = SYMBOL_MEXC if name == 'mexc' else SYMBOL_BINANCE
+                ex.fetch_ohlcv(sym, '1m', limit=2)
                 self.exchange = ex
                 self.exchange_name = name
-                print(f"Using exchange: {name}")
+                print(f"Using exchange: {name} | {sym}")
                 break
             except Exception as e:
                 print(f"{name} failed: {e}")
@@ -327,6 +332,9 @@ class PaperTradingEngine:
         self.running = False
         self.last_fetch = None
         self.error = None
+        self.live_price = None          # real-time price from WebSocket
+        self.live_price_time = None     # timestamp of last price update
+        self.ws_connected = False
         self.state_file = Path(__file__).parent / "paper_state.json"
         self._load_state()
 
@@ -357,7 +365,8 @@ class PaperTradingEngine:
     def fetch_candles(self):
         """Fetch latest candles from exchange."""
         try:
-            ohlcv = self.exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=CANDLE_BUFFER)
+            symbol = SYMBOL_MEXC if self.exchange_name == 'mexc' else SYMBOL_BINANCE
+            ohlcv = self.exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=CANDLE_BUFFER)
             self.candles.clear()
             for c in ohlcv:
                 self.candles.append({
@@ -435,7 +444,7 @@ class PaperTradingEngine:
         self.trade_id += 1
         trade = PaperTrade(
             id=self.trade_id,
-            symbol=SYMBOL,
+            symbol=SYMBOL_DISPLAY,
             side=direction,
             entry_price=price,
             size=notional,
@@ -548,6 +557,9 @@ class PaperTradingEngine:
             'avg_loss': round(np.mean([t.pnl for t in lose_trades]), 2) if lose_trades else 0,
             'position': asdict(self.position) if self.position else None,
             'last_fetch': self.last_fetch,
+            'live_price': self.live_price,
+            'live_price_time': self.live_price_time,
+            'ws_connected': self.ws_connected,
             'error': self.error,
             'running': self.running,
             'candles_loaded': len(self.candles),
@@ -582,8 +594,105 @@ class PaperTradingEngine:
 engine = PaperTradingEngine()
 
 
+# ============================================================
+# BINANCE WEBSOCKET (real-time price, ~100ms updates)
+# ============================================================
+def ws_price_stream():
+    """Stream real-time SILVER price from MEXC WebSocket."""
+    import websocket as ws_lib
+    
+    # MEXC futures WebSocket for SILVER/USDT
+    ws_url = "wss://contract.mexc.com/depth/SILVER_USDT"
+    
+    def on_message(ws, message):
+        try:
+            data = json.loads(message)
+            if data.get('data'):
+                # MEXC depth channel - use last trade price
+                last_price = data['data'].get('last')
+                if last_price:
+                    engine.live_price = float(last_price)
+                    engine.live_price_time = datetime.now(timezone.utc).isoformat()
+                # Also try ask/bid
+                asks = data['data'].get('asks', [])
+                bids = data['data'].get('bids', [])
+                if asks and bids:
+                    mid = (float(asks[0][0]) + float(bids[0][0])) / 2
+                    engine.live_price = mid
+                    engine.live_price_time = datetime.now(timezone.utc).isoformat()
+        except Exception:
+            pass
+    
+    def on_error(ws, error):
+        engine.ws_connected = False
+    
+    def on_close(ws, code, msg):
+        engine.ws_connected = False
+        time.sleep(3)
+        ws_price_stream()  # reconnect
+    
+    def on_open(ws):
+        engine.ws_connected = True
+        print(f"WebSocket connected: SILVER/USDT live price streaming")
+    
+    while True:
+        try:
+            ws = ws_lib.WebSocketApp(
+                ws_url,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+                on_open=on_open,
+            )
+            ws.run_forever(ping_interval=30)
+        except Exception:
+            pass
+        time.sleep(5)
+
+
+# ============================================================
+# FAST TP/SL CHECK (runs every 1 second on live price)
+# ============================================================
+def fast_exit_loop():
+    """Check TP/SL every 1 second using real-time WebSocket price."""
+    while True:
+        try:
+            if engine.running and engine.position and engine.live_price:
+                pos = engine.position
+                price = engine.live_price
+                exit_price = None
+                exit_reason = None
+                
+                if pos.side == 'long':
+                    # Need high/low — use live_price as both for real-time
+                    # Check against SL first (worst case), then TP
+                    if price <= pos.stop_loss:
+                        exit_price = pos.stop_loss
+                        exit_reason = 'stop_loss'
+                    elif price >= pos.take_profit:
+                        exit_price = pos.take_profit
+                        exit_reason = 'take_profit'
+                else:
+                    if price >= pos.stop_loss:
+                        exit_price = pos.stop_loss
+                        exit_reason = 'stop_loss'
+                    elif price <= pos.take_profit:
+                        exit_price = pos.take_profit
+                        exit_reason = 'take_profit'
+                
+                if exit_price is not None:
+                    engine.close_trade(exit_price, exit_reason)
+                    print(f"CLOSED: {exit_reason} @ {exit_price}")
+        except Exception:
+            pass
+        time.sleep(WS_TICK_INTERVAL)
+
+
+# ============================================================
+# CANDLE FETCH LOOP (every 15 seconds)
+# ============================================================
 def background_loop():
-    """Background thread that runs the strategy."""
+    """Background thread: fetch candles + run strategy."""
     while True:
         if engine.running:
             engine.tick()
@@ -635,10 +744,21 @@ def api_reset():
 # STARTUP (runs when gunicorn loads the module)
 # ============================================================
 def _start_background():
-    t = threading.Thread(target=background_loop, daemon=True)
-    t.start()
+    # Thread 1: Candle fetch + strategy (every 15s)
+    t1 = threading.Thread(target=background_loop, daemon=True)
+    t1.start()
+    
+    # Thread 2: WebSocket real-time price (continuous)
+    t2 = threading.Thread(target=ws_price_stream, daemon=True)
+    t2.start()
+    
+    # Thread 3: Fast TP/SL exit check (every 1s)
+    t3 = threading.Thread(target=fast_exit_loop, daemon=True)
+    t3.start()
+    
     engine.fetch_candles()
     engine.running = True
+    print(f"Started: candle loop (15s) + WebSocket (real-time) + fast exit (1s)")
 
 _start_background()
 

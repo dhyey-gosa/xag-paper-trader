@@ -17,7 +17,7 @@ from collections import deque
 import ccxt
 import numpy as np
 import pandas as pd
-from flask import Flask, render_template, jsonify
+from flask import Flask, render_template, jsonify, request
 
 # ============================================================
 # CONFIG
@@ -71,15 +71,16 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     v = df["volume"].values
     n = len(df)
 
-    # EMA
+    # EMA (seeded with first value — matches backtester, never NaN)
     def ema(data, period):
-        result = np.full(len(data), np.nan)
-        if len(data) < period:
+        data = np.asarray(data, dtype=np.float64)
+        result = np.empty(len(data), dtype=np.float64)
+        if len(data) == 0:
             return result
-        result[period-1] = np.mean(data[:period])
-        mult = 2.0 / (period + 1)
-        for i in range(period, len(data)):
-            result[i] = (data[i] - result[i-1]) * mult + result[i-1]
+        alpha = 2.0 / (period + 1)
+        result[0] = data[0]
+        for i in range(1, len(data)):
+            result[i] = alpha * data[i] + (1 - alpha) * result[i - 1]
         return result
 
     df["ema_fast"] = ema(c, 8)
@@ -120,9 +121,10 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     dx = 100 * np.abs(plus_di - minus_di) / np.where((plus_di + minus_di) > 0, plus_di + minus_di, 1)
     df["adx"] = ema(dx, 14)
 
-    # Momentum
-    df["momentum"] = c - np.roll(c, 10)
-    df["momentum"][0:10] = 0
+    # Momentum (plain numpy array — no pandas chained assignment)
+    mom_arr = c - np.roll(c, 10)
+    mom_arr[0:10] = 0.0
+    df["momentum"] = mom_arr
 
     # Volume spike
     vol_sma = pd.Series(v).rolling(20).mean().values
@@ -303,9 +305,9 @@ class PaperTradingEngine:
         # Try exchanges in order: MEXC works everywhere (incl Render US)
         # Binance/Bybit only work from India
         exchanges_to_try = [
-            ('mexc', ccxt.mexc, {'enableRateLimit': True, 'options': {'defaultType': 'swap'}}),
-            ('binance', ccxt.binance, {'enableRateLimit': True, 'options': {'defaultType': 'future'}}),
-            ('bybit', ccxt.bybit, {'enableRateLimit': True, 'options': {'defaultType': 'linear'}}),
+            ('mexc', ccxt.mexc, {'enableRateLimit': True, 'timeout': 15000, 'options': {'defaultType': 'swap'}}),
+            ('binance', ccxt.binance, {'enableRateLimit': True, 'timeout': 15000, 'options': {'defaultType': 'future'}}),
+            ('bybit', ccxt.bybit, {'enableRateLimit': True, 'timeout': 15000, 'options': {'defaultType': 'linear'}}),
         ]
         for name, cls, opts in exchanges_to_try:
             try:
@@ -331,6 +333,9 @@ class PaperTradingEngine:
         self.last_signal_bar = -999
         self.running = False
         self.last_fetch = None
+        self.last_tick = None
+        self.tick_count = 0
+        self.last_diag = {}
         self.error = None
         self.live_price = None          # real-time price from WebSocket
         self.live_price_time = None     # timestamp of last price update
@@ -385,27 +390,52 @@ class PaperTradingEngine:
             return False
 
     def run_strategy(self):
-        """Run strategy on current candle buffer."""
+        """Run strategy on current candle buffer (uses last CLOSED bar)."""
         if len(self.candles) < 60:
+            self.last_diag = {'reason': 'warming_up', 'candles': len(self.candles)}
             return None
 
         df = pd.DataFrame(list(self.candles))
         df.set_index('timestamp', inplace=True)
         df = compute_indicators(df)
+        sig_bo = generate_breakout_signals(df)
+        sig_mo = generate_momentum_signals(df)
         signals = generate_combined_signals(df)
 
-        # Check last bar for signal
-        last_idx = len(df) - 1
-        if signals[last_idx] == 0:
+        # Last CLOSED 1m bar — never trade the still-forming candle
+        closed_idx = len(df) - 2
+        price = float(df['close'].iloc[closed_idx])
+        atr_v = float(df['atr_smooth'].iloc[closed_idx])
+        diag = {
+            'bar_time': str(df.index[closed_idx]),
+            'close': round(price, 4),
+            'atr': round(atr_v, 6) if atr_v == atr_v else None,
+            'atr_price_ratio': round(atr_v / price, 6) if atr_v == atr_v and price else None,
+            'breakout_votes_total': int(np.sum(sig_bo != 0)),
+            'momentum_votes_total': int(np.sum(sig_mo != 0)),
+            'combined_votes_total': int(np.sum(signals != 0)),
+            'closed_bar_signal': int(signals[closed_idx]),
+        }
+        if signals[closed_idx] == 0:
+            diag['reason'] = 'no_signal_on_closed_bar'
+            self.last_diag = diag
             return None
-        if last_idx - self.last_signal_bar < 10:
+        if closed_idx - self.last_signal_bar < 10:
+            diag['reason'] = 'cooldown'
+            self.last_diag = diag
+            return None
+        if not (atr_v == atr_v) or atr_v <= 0:
+            diag['reason'] = 'bad_atr'
+            self.last_diag = diag
             return None
 
+        diag['reason'] = 'signal'
+        self.last_diag = diag
         return {
-            'direction': 'long' if signals[last_idx] == 1 else 'short',
-            'price': df['close'].iloc[-1],
-            'atr': df['atr_smooth'].iloc[-1],
-            'bar_idx': last_idx,
+            'direction': 'long' if signals[closed_idx] == 1 else 'short',
+            'price': price,
+            'atr': atr_v,
+            'bar_idx': closed_idx,
         }
 
     def open_trade(self, signal):
@@ -525,6 +555,8 @@ class PaperTradingEngine:
         """One iteration: fetch, check, maybe trade."""
         if not self.running:
             return
+        self.tick_count += 1
+        self.last_tick = datetime.now(timezone.utc).isoformat()
         try:
             self.fetch_candles()
             if self.position:
@@ -557,6 +589,9 @@ class PaperTradingEngine:
             'avg_loss': round(np.mean([t.pnl for t in lose_trades]), 2) if lose_trades else 0,
             'position': asdict(self.position) if self.position else None,
             'last_fetch': self.last_fetch,
+            'last_tick': self.last_tick,
+            'tick_count': self.tick_count,
+            'last_diag': self.last_diag,
             'live_price': self.live_price,
             'live_price_time': self.live_price_time,
             'ws_connected': self.ws_connected,
@@ -595,59 +630,29 @@ engine = PaperTradingEngine()
 
 
 # ============================================================
-# BINANCE WEBSOCKET (real-time price, ~100ms updates)
+# LIVE PRICE POLLER (REST ticker every 3s — reliable, no WS guesswork)
 # ============================================================
-def ws_price_stream():
-    """Stream real-time SILVER price from MEXC WebSocket."""
-    import websocket as ws_lib
-    
-    # MEXC futures WebSocket for SILVER/USDT
-    ws_url = "wss://contract.mexc.com/depth/SILVER_USDT"
-    
-    def on_message(ws, message):
-        try:
-            data = json.loads(message)
-            if data.get('data'):
-                # MEXC depth channel - use last trade price
-                last_price = data['data'].get('last')
-                if last_price:
-                    engine.live_price = float(last_price)
-                    engine.live_price_time = datetime.now(timezone.utc).isoformat()
-                # Also try ask/bid
-                asks = data['data'].get('asks', [])
-                bids = data['data'].get('bids', [])
-                if asks and bids:
-                    mid = (float(asks[0][0]) + float(bids[0][0])) / 2
-                    engine.live_price = mid
-                    engine.live_price_time = datetime.now(timezone.utc).isoformat()
-        except Exception:
-            pass
-    
-    def on_error(ws, error):
-        engine.ws_connected = False
-    
-    def on_close(ws, code, msg):
-        engine.ws_connected = False
-        time.sleep(3)
-        ws_price_stream()  # reconnect
-    
-    def on_open(ws):
-        engine.ws_connected = True
-        print(f"WebSocket connected: SILVER/USDT live price streaming")
-    
+def live_price_loop():
+    """Poll exchange ticker for real-time price (drives 1s TP/SL checks)."""
     while True:
         try:
-            ws = ws_lib.WebSocketApp(
-                ws_url,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close,
-                on_open=on_open,
-            )
-            ws.run_forever(ping_interval=30)
+            if engine.exchange is not None:
+                symbol = SYMBOL_MEXC if engine.exchange_name == 'mexc' else SYMBOL_BINANCE
+                t = engine.exchange.fetch_ticker(symbol)
+                px = t.get('last') or t.get('close')
+                if px:
+                    engine.live_price = float(px)
+                    engine.live_price_time = datetime.now(timezone.utc).isoformat()
+                    engine.ws_connected = True
         except Exception:
-            pass
-        time.sleep(5)
+            try:
+                if engine.live_price_time:
+                    age = (datetime.now(timezone.utc) - datetime.fromisoformat(engine.live_price_time)).total_seconds()
+                    if age > 15:
+                        engine.ws_connected = False
+            except Exception:
+                pass
+        time.sleep(3)
 
 
 # ============================================================
@@ -689,13 +694,19 @@ def fast_exit_loop():
 
 
 # ============================================================
-# CANDLE FETCH LOOP (every 15 seconds)
+# CANDLE FETCH LOOP (every 10 seconds)
 # ============================================================
 def background_loop():
-    """Background thread: fetch candles + run strategy."""
+    """Background thread: fetch candles + run strategy. Never dies."""
     while True:
-        if engine.running:
-            engine.tick()
+        try:
+            if engine.running:
+                engine.tick()
+        except Exception as e:
+            try:
+                engine.error = f"Loop error: {e}"
+            except Exception:
+                pass
         time.sleep(FETCH_INTERVAL)
 
 
@@ -712,8 +723,12 @@ def api_status():
 
 @app.route('/api/trades')
 def api_trades():
-    limit = int(np.clip(int(pd.Timestamp.now().timestamp()) % 100, 10, 100))
-    return jsonify(engine.get_trades(limit=50))
+    try:
+        limit = int(request.args.get('limit', 50))
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 200))
+    return jsonify(engine.get_trades(limit=limit))
 
 @app.route('/api/equity')
 def api_equity():
@@ -744,21 +759,21 @@ def api_reset():
 # STARTUP (runs when gunicorn loads the module)
 # ============================================================
 def _start_background():
-    # Thread 1: Candle fetch + strategy (every 15s)
+    # Thread 1: Candle fetch + strategy (every 10s)
     t1 = threading.Thread(target=background_loop, daemon=True)
     t1.start()
-    
-    # Thread 2: WebSocket real-time price (continuous)
-    t2 = threading.Thread(target=ws_price_stream, daemon=True)
+
+    # Thread 2: Live price poller (REST ticker every 3s)
+    t2 = threading.Thread(target=live_price_loop, daemon=True)
     t2.start()
-    
+
     # Thread 3: Fast TP/SL exit check (every 1s)
     t3 = threading.Thread(target=fast_exit_loop, daemon=True)
     t3.start()
-    
+
     engine.fetch_candles()
     engine.running = True
-    print(f"Started: candle loop (15s) + WebSocket (real-time) + fast exit (1s)")
+    print("Started: candle loop (10s) + live price poller (3s) + fast exit (1s)")
 
 _start_background()
 

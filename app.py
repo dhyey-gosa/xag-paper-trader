@@ -336,6 +336,7 @@ class PaperTradingEngine:
         self.last_tick = None
         self.tick_count = 0
         self.last_diag = {}
+        self._tick_lock = threading.Lock()
         self.error = None
         self.live_price = None          # real-time price from WebSocket
         self.live_price_time = None     # timestamp of last price update
@@ -485,6 +486,7 @@ class PaperTradingEngine:
         self.position = trade
         self.last_signal_bar = signal['bar_idx']
         self._save_state()
+        print(f"OPEN {direction} @ {price:.4f} | SL {sl:.4f} TP {tp:.4f} | notional {notional:.2f} INR", flush=True)
         return trade
 
     def check_exit(self):
@@ -550,6 +552,27 @@ class PaperTradingEngine:
             'equity': round(self.capital, 2),
         })
         self._save_state()
+        print(f"CLOSED {reason} @ {exit_price:.4f} | pnl {pos.pnl} INR | capital {self.capital:.2f}", flush=True)
+
+    def maybe_tick(self, min_interval=FETCH_INTERVAL):
+        """Tick at most once per min_interval. Safe to call from any thread
+        (request handlers, background loop). Non-blocking if a tick is running."""
+        if not self.running:
+            return False
+        if self.last_tick:
+            try:
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(self.last_tick)).total_seconds()
+                if age < min_interval:
+                    return False
+            except Exception:
+                pass
+        if not self._tick_lock.acquire(blocking=False):
+            return False
+        try:
+            self.tick()
+        finally:
+            self._tick_lock.release()
+        return True
 
     def tick(self):
         """One iteration: fetch, check, maybe trade."""
@@ -687,7 +710,6 @@ def fast_exit_loop():
                 
                 if exit_price is not None:
                     engine.close_trade(exit_price, exit_reason)
-                    print(f"CLOSED: {exit_reason} @ {exit_price}")
         except Exception:
             pass
         time.sleep(WS_TICK_INTERVAL)
@@ -697,11 +719,11 @@ def fast_exit_loop():
 # CANDLE FETCH LOOP (every 10 seconds)
 # ============================================================
 def background_loop():
-    """Background thread: fetch candles + run strategy. Never dies."""
+    """Background thread: fetch candles + run strategy. Never dies.
+    (Backup path — requests also drive ticks via maybe_tick.)"""
     while True:
         try:
-            if engine.running:
-                engine.tick()
+            engine.maybe_tick()
         except Exception as e:
             try:
                 engine.error = f"Loop error: {e}"
@@ -719,7 +741,23 @@ def dashboard():
 
 @app.route('/api/status')
 def api_status():
+    # Drive the engine from traffic: works even if background threads stall.
+    # Dashboard polls this every 1s, so ticks stay on ~10s cadence.
+    try:
+        engine.maybe_tick()
+    except Exception:
+        pass
     return jsonify(engine.get_status())
+
+
+@app.route('/api/tick', methods=['GET', 'POST'])
+def api_tick():
+    """External cron/keep-alive hook: force an engine tick."""
+    try:
+        ran = engine.maybe_tick(min_interval=5)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+    return jsonify({'ok': True, 'ticked': ran, 'tick_count': engine.tick_count})
 
 @app.route('/api/trades')
 def api_trades():
